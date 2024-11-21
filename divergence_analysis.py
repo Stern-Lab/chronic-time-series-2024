@@ -386,7 +386,7 @@ r_dict['no_p5']=[divergence_rate_s,intercept_s,p_val_s]
 #Non-Synonymous - w/o N1 T241 (BAL sample)
 ns_df_rs = regress_and_table_non_syn(final_df_241,['Not-Syn']) # will also print P-values 
 
-#Non-Synonymous - w/o N1 T241 (BAL sample)
+#Non-Synonymous and Indels - w/o N1 T241 (BAL sample)
 ns_and_indels_df_rs = regress_and_table_non_syn(final_df_241,['Not-Syn','Indel']) # will also print P-values 
 
 
