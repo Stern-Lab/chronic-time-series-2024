@@ -5,29 +5,60 @@ library(broom)
 library(forcats)
 library(car)
 
+# === CONFIG ===
+path_syn <- "/sternadi/home/volume3/sars_cov_2/PRJNA1055920/patients_comparison/published_data/5_syn_summary_per_tp.csv"
+path_nonsyn <- "/sternadi/home/volume3/sars_cov_2/PRJNA1055920/patients_comparison/published_data/5_nonsyn_summary_per_tp.csv"
+time_col <- "dpso"
+exclude_patients <- c("aids_na_1", "aids_na_10", "aids_na_2")
+out_dir <- "/sternadi/home/volume3/sars_cov_2/PRJNA1055920/patients_comparison/divergence_calculations"
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+# Save interactive HTML plots when plotly/htmlwidgets are available.
+save_plot_html <- function(plot_obj, out_path) {
+  if (!requireNamespace("plotly", quietly = TRUE) ||
+      !requireNamespace("htmlwidgets", quietly = TRUE)) {
+    warning("Skipping HTML plot export: install 'plotly' and 'htmlwidgets'.")
+    return(invisible(NULL))
+  }
+  htmlwidgets::saveWidget(
+    widget = plotly::ggplotly(plot_obj),
+    file = out_path,
+    selfcontained = TRUE
+  )
+}
+
 # === PART 1: SYNONYMOUS GLM ===
 
 # Load data
-df_raw_syn <- read.csv("path/to/synonymous_data.csv")
+df_raw_syn <- read_csv(path_syn, show_col_types = FALSE) %>%
+  transmute(
+    patient_id = patient_id,
+    time = .data[[time_col]],
+    divergence = div_s_spike
+  )
 
 # Compute jumps and prepare dataframe
 df_syn <- df_raw_syn %>%
-  filter(patient_id != "N7") %>%
+ # filter(patient_id != "N7") %>%
+  filter(!patient_id %in% exclude_patients) %>%
   arrange(patient_id, time) %>%
   group_by(patient_id) %>%
   mutate(jump = if_else(row_number() == 1, 0, divergence - lag(divergence))) %>%
   ungroup()
 
 # Plot observed synonymous divergence
-ggplot(df_syn, aes(x = time, y = divergence, color = patient_id)) +
+p_syn <- ggplot(df_syn, aes(x = time, y = divergence, color = patient_id)) +
   geom_point(size = 2) +
   labs(x = "Days", y = "Observed synonymous divergence", color = "Patient ID") +
   theme_minimal(base_size = 16)
+ggsave(file.path(out_dir, "synonymous_trajectories.png"), plot = p_syn, width = 10, height = 6, dpi = 300)
+save_plot_html(p_syn, file.path(out_dir, "synonymous_trajectories.html"))
 
 # Fit GLM with binary jump threshold
 rate_thresh <- 1e-5
 df2 <- df_raw_syn %>%
   filter(patient_id != "N7") %>%
+  filter(!patient_id %in% exclude_patients) %>%
   arrange(patient_id, time) %>%
   group_by(patient_id) %>%
   mutate(dt = time - lag(time),
@@ -54,6 +85,7 @@ grid <- tibble(rate_thresh = 10^seq(-6, -4, length = 9))
 rate_grid <- grid %>% mutate(mu_hat = map_dbl(rate_thresh, function(th) {
   df_tmp <- df_raw_syn %>%
     filter(patient_id != "N7") %>%
+    filter(!patient_id %in% exclude_patients) %>%
     arrange(patient_id, time) %>%
     group_by(patient_id) %>%
     mutate(dt = time - lag(time),
@@ -82,6 +114,12 @@ bootstrap_median_syn_rate2 <- median(bootstrap_results2$mutation_rate)
 bootstrap_se2 <- sd(bootstrap_results2$mutation_rate)
 ci <- quantile(bootstrap_results2$mutation_rate, probs = c(0.025, 0.975))
 cat("Bootstrapped Mutation-rate median estimate:", sci(bootstrap_median_syn_rate2), "95% CI:", ci, "\n")
+syn_summary <- tibble(
+  metric = c("mu_hat", "mu_low", "mu_high", "bootstrap_median", "bootstrap_ci_low", "bootstrap_ci_high"),
+  value = c(mu_hat, mu_low, mu_high, bootstrap_median_syn_rate2, ci[[1]], ci[[2]])
+)
+write_csv(syn_summary, file.path(out_dir, "synonymous_rate_summary.csv"))
+write_csv(rate_grid, file.path(out_dir, "synonymous_threshold_sensitivity.csv"))
 
 # GLM with time limit
 max_days <- 180
@@ -90,15 +128,21 @@ model_filtered <- glm(divergence ~ time + jump, data = filtered_df, family = gau
 summary(model_filtered)
 
 # === PART 2: NON-SYNONYMOUS REGRESSION ===
-data_dir <- "path/to/non_syn_data/"
-files <- list.files(data_dir, pattern = "\\.csv$", full.names = TRUE)
+nonsyn_collapsed <- read_csv(path_nonsyn, show_col_types = FALSE) %>%
+  group_by(patient_id, visit) %>%
+  summarize(
+    time = first(.data[[time_col]]),
+    divergence = first(div_n_spike),
+    .groups = "drop"
+  ) %>%
+  filter(patient_id != "N7") %>%
+  filter(!patient_id %in% exclude_patients)
 
-all_res <- map_dfr(files, function(f) {
-  patient_id <- sub("_.*$", "", tools::file_path_sans_ext(basename(f)))
+all_res <- map_dfr(split(nonsyn_collapsed, nonsyn_collapsed$patient_id), function(df) {
+  patient_id <- df$patient_id[[1]]
   if (patient_id == "N7") return(NULL)
 
-  df <- read_csv(f, show_col_types = FALSE) %>%
-    rename(time = timepoint, divergence = final_freq, patient_id = patient) %>%
+  df <- df %>%
     arrange(time) %>%
     mutate(jump = divergence - lag(divergence))
 
@@ -132,11 +176,12 @@ all_res <- map_dfr(files, function(f) {
     ),
     dn_ds = rate / syn_rate
   )
+write_csv(all_res, file.path(out_dir, "nonsyn_patient_rates.csv"))
 
 # Plot non-syn divergence vs syn rate
 breaks <- pretty(range(c(all_res$lower_CI, all_res$upper_CI, syn_CI)), n = 5)
 
-ggplot(all_res, aes(x = rate, y = fct_reorder(patient, rate))) +
+p_nonsyn_rate <- ggplot(all_res, aes(x = rate, y = fct_reorder(patient, rate))) +
   annotate("rect", xmin = syn_CI[1], xmax = syn_CI[2], ymin = -Inf, ymax = Inf, fill = "steelblue", alpha = 0.15) +
   geom_vline(xintercept = syn_rate, color = "steelblue", linetype = "dashed") +
   geom_errorbarh(aes(xmin = lower_CI, xmax = upper_CI), height = 0.2) +
@@ -151,24 +196,21 @@ ggplot(all_res, aes(x = rate, y = fct_reorder(patient, rate))) +
   ) +
   labs(y = "Patient") +
   theme_minimal(base_size = 16)
+ggsave(file.path(out_dir, "nonsyn_vs_syn_rates.png"), plot = p_nonsyn_rate, width = 11, height = 7, dpi = 300)
+save_plot_html(p_nonsyn_rate, file.path(out_dir, "nonsyn_vs_syn_rates.html"))
 
 # === PART 3: Detect large divergence jumps ===
-all_patients_data <- map_dfr(files, function(f) {
-  patient_id <- sub("_.*$", "", tools::file_path_sans_ext(basename(f)))
-  if (patient_id == "N7") return(NULL)
-  df <- read_csv(f, show_col_types = FALSE) %>%
-    rename(time = timepoint, divergence = final_freq, patient_id = patient) %>%
-    arrange(time) %>%
-    mutate(jump = divergence - lag(divergence), patient_id = patient_id)
-  df
-}) %>%
+all_patients_data <- nonsyn_collapsed %>%
   arrange(patient_id, time) %>%
   group_by(patient_id) %>%
+  mutate(jump = divergence - lag(divergence),
+         patient_id = patient_id) %>%
   mutate(delta_divergence = divergence - lag(divergence),
          delta_time = time - lag(time),
          observed_rate = delta_divergence / delta_time) %>%
   ungroup() %>%
   mutate(big_jump = observed_rate > (2 * syn_rate))
+write_csv(all_patients_data, file.path(out_dir, "nonsyn_jump_table.csv"))
 
 plot_df <- all_patients_data %>%
   group_by(patient_id) %>%
@@ -176,10 +218,12 @@ plot_df <- all_patients_data %>%
   ungroup() %>%
   mutate(patient_id = fct_reorder(patient_id, max_day, .desc = FALSE))
 
-ggplot(plot_df, aes(x = time, y = divergence, color = big_jump)) +
+p_jumps <- ggplot(plot_df, aes(x = time, y = divergence, color = big_jump)) +
   geom_point(size = 2) +
   geom_line(aes(group = patient_id), color = "gray50") +
   facet_wrap(~ patient_id, scales = "free_x") +
   scale_color_manual(values = c("black", "red"), labels = c("Normal", "Elevated")) +
   labs(x = "Days", y = "Non-synonymous divergence", color = "Rate Status") +
   theme_minimal(base_size = 14)
+ggsave(file.path(out_dir, "nonsyn_elevated_jumps.png"), plot = p_jumps, width = 12, height = 8, dpi = 300)
+save_plot_html(p_jumps, file.path(out_dir, "nonsyn_elevated_jumps.html"))
